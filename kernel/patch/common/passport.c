@@ -7,14 +7,14 @@
 #include <linux/sched.h>
 #include <linux/errno.h>
 #include <linux/gfp.h>
-#include <linux/cred.h>      // current_uid()
-#include <asm/current.h>     // current
+#include <linux/cred.h>
+#include <asm/current.h>
 
 #define PASSPORT_HASH_BITS 8
 #define PASSPORT_HASH_SIZE (1 << PASSPORT_HASH_BITS)
 
 struct passport_entry {
-    pid_t pid;
+    int pid;
     uid_t uid;
     struct list_head list;
 };
@@ -22,13 +22,12 @@ struct passport_entry {
 static struct list_head passport_table[PASSPORT_HASH_SIZE];
 static DEFINE_SPINLOCK(passport_lock);
 
-static inline unsigned int passport_hash(pid_t pid)
+static inline unsigned int passport_hash(int pid)
 {
     return pid & (PASSPORT_HASH_SIZE - 1);
 }
 
-/* 添加通行证（内部函数） */
-static int add_passport_entry(pid_t pid, uid_t uid)
+static int add_passport_entry(int pid, uid_t uid)
 {
     struct passport_entry *entry;
     unsigned int hash = passport_hash(pid);
@@ -37,7 +36,7 @@ static int add_passport_entry(pid_t pid, uid_t uid)
     list_for_each_entry(entry, &passport_table[hash], list) {
         if (entry->pid == pid && entry->uid == uid) {
             spin_unlock(&passport_lock);
-            return 0; // 已存在
+            return 0;
         }
     }
     spin_unlock(&passport_lock);
@@ -55,8 +54,7 @@ static int add_passport_entry(pid_t pid, uid_t uid)
     return 0;
 }
 
-/* 移除通行证 */
-int remove_passport_pid(pid_t pid)
+int remove_passport_pid(int pid)
 {
     struct passport_entry *entry;
     int found = 0;
@@ -76,7 +74,6 @@ int remove_passport_pid(pid_t pid)
     return found ? 0 : -ENOENT;
 }
 
-/* 清空所有通行证 */
 void clear_passport(void)
 {
     struct passport_entry *entry, *tmp;
@@ -93,10 +90,9 @@ void clear_passport(void)
     pr_info("KPASS: cleared all passports\n");
 }
 
-/* 核心检查函数：检查当前进程是否有通行证 */
 int has_passport(void)
 {
-    pid_t pid = current->pid;
+    int pid = current->pid;
     uid_t uid = current_uid();
     struct passport_entry *entry;
     int found = 0;
@@ -119,7 +115,6 @@ int has_passport(void)
     return found;
 }
 
-/* 初始化（在 su_compat_init 中调用） */
 void init_passport(void)
 {
     int i;
