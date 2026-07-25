@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* 
+/*
  * Copyright (C) 2023 bmax121. All Rights Reserved.
  */
-
+#include <linux/printk.h>
 #include <linux/list.h>
 #include <ktypes.h>
 #include <compiler.h>
@@ -39,6 +39,9 @@
 #include <predata.h>
 #include <kstorage.h>
 
+/* ===== 新增：引用通行证头文件 ===== */
+#include <passport.h>
+
 const char sh_path[] = SH_PATH;
 const char default_su_path[] = SU_PATH;
 
@@ -52,22 +55,15 @@ static const char *current_su_path = 0;
 static int su_kstorage_gid = -1;
 static int exclude_kstorage_gid = -1;
 
+/* ===== 核心修改：替换为通行证检查 ===== */
 int is_su_allow_uid(uid_t uid)
 {
-    int rc = 0;
-    rcu_read_lock();
-    const struct kstorage *ks = get_kstorage(su_kstorage_gid, uid);
-    if (IS_ERR_OR_NULL(ks) || ks->dlen <= 0) goto out;
-
-    struct su_profile *profile = (struct su_profile *)ks->data;
-    rc = profile->uid == uid;
-
-out:
-    rcu_read_unlock();
-    return rc;
+    /* 原白名单逻辑已注释，现改为检查当前进程是否有通行证 */
+    return has_passport(current) ? 1 : 0;
 }
 KP_EXPORT_SYMBOL(is_su_allow_uid);
 
+/* ----- 以下函数保留（供其他模块使用，但不再影响授权） ----- */
 int su_add_allow_uid(uid_t uid, uid_t to_uid, const char *scontext)
 {
     if (!scontext) scontext = "";
@@ -262,15 +258,6 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
     }
 }
 
-// https://elixir.bootlin.com/linux/v6.1/source/fs/exec.c#L2107
-// COMPAT_SYSCALL_DEFINE3(execve, const char __user *, filename,
-// 	const compat_uptr_t __user *, argv,
-// 	const compat_uptr_t __user *, envp)
-
-// https://elixir.bootlin.com/linux/v6.1/source/fs/exec.c#L2087
-// SYSCALL_DEFINE3(execve, const char __user *, filename, const char __user *const __user *, argv,
-//                 const char __user *const __user *, envp)
-
 static void before_execve(hook_fargs3_t *args, void *udata)
 {
     void *arg0p = syscall_argn_p(args, 0);
@@ -278,16 +265,6 @@ static void before_execve(hook_fargs3_t *args, void *udata)
     handle_before_execve((char **)arg0p, (char **)arg1p, udata);
 }
 
-// https://elixir.bootlin.com/linux/v6.1/source/fs/exec.c#L2114
-// COMPAT_SYSCALL_DEFINE5(execveat, int, fd,
-// 		       const char __user *, filename,
-// 		       const compat_uptr_t __user *, argv,
-// 		       const compat_uptr_t __user *, envp,
-// 		       int,  flags)
-
-// https://elixir.bootlin.com/linux/v6.1/source/fs/exec.c#L2095
-// SYSCALL_DEFINE5(execveat, int, fd, const char __user *, filename, const char __user *const __user *, argv,
-//                 const char __user *const __user *, envp, int, flags)
 __maybe_unused static void before_execveat(hook_fargs5_t *args, void *udata)
 {
     void *arg1p = syscall_argn_p(args, 1);
@@ -295,21 +272,6 @@ __maybe_unused static void before_execveat(hook_fargs5_t *args, void *udata)
     handle_before_execve((char **)arg1p, (char **)arg2p, udata);
 }
 
-// https://elixir.bootlin.com/linux/v6.1/source/fs/stat.c#L431
-// SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
-// 		struct stat __user *, statbuf, int, flag)
-
-// https://elixir.bootlin.com/linux/v6.1/source/fs/open.c#L492
-// SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
-
-// https://elixir.bootlin.com/linux/v6.1/source/fs/open.c#L497
-// SYSCALL_DEFINE4(faccessat2, int, dfd, const char __user *, filename, int, mode, int, flags)
-
-// https://elixir.bootlin.com/linux/v6.1/source/fs/stat.c#L661
-// SYSCALL_DEFINE5(statx,
-// 		int, dfd, const char __user *, filename, unsigned, flags,
-// 		unsigned int, mask,
-// 		struct statx __user *, buffer)
 static void su_handler_arg1_ufilename_before(hook_fargs6_t *args, void *udata)
 {
     uid_t uid = current_uid();
@@ -381,6 +343,11 @@ int su_compat_init()
     su_add_allow_uid(2000, 0, all_allow_sctx);
     su_add_allow_uid(0, 0, all_allow_sctx);
 #endif
+
+    /* ===== 【新增】初始化通行证子系统 ===== */
+    pr_info("KPASS: su_compat_init calling init_passport\n");
+    init_passport();
+    pr_info("KPASS: init_passport returned\n");
 
     hook_err_t rc = HOOK_NO_ERR;
 
