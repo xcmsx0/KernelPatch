@@ -1,23 +1,31 @@
 // kernel/patch/common/passport.c
 #include <passport.h>
-#include <linux/hashtable.h>
 #include <linux/slab.h>
 #include <linux/rwlock.h>
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
 #include <linux/printk.h>
+#include <linux/list.h>      // 使用 list_head
 
 #define PASSPORT_HASH_BITS 8
+#define PASSPORT_HASH_SIZE (1 << PASSPORT_HASH_BITS)
 
 struct passport_entry {
     pid_t pid;
-    uid_t uid;          // 记录授权时的 UID，防止 PID 伪造
-    struct hlist_node hlist;
+    uid_t uid;
+    struct list_head list;   // 用于哈希桶链表
 };
 
-static DEFINE_HASHTABLE(passport_table, PASSPORT_HASH_BITS);
+// 哈希桶数组
+static struct list_head passport_table[PASSPORT_HASH_SIZE];
 static DEFINE_RWLOCK(passport_lock);
+
+// 简单的哈希函数
+static inline unsigned int passport_hash(pid_t pid)
+{
+    return pid & (PASSPORT_HASH_SIZE - 1);
+}
 
 /* ===== 核心检查函数 ===== */
 int has_passport(struct task_struct *task)
@@ -26,9 +34,10 @@ int has_passport(struct task_struct *task)
     uid_t uid = task->uid;
     struct passport_entry *entry;
     int found = 0;
+    unsigned int hash = passport_hash(pid);
 
     read_lock(&passport_lock);
-    hash_for_each_possible(passport_table, entry, hlist, pid) {
+    list_for_each_entry(entry, &passport_table[hash], list) {
         if (entry->pid == pid && entry->uid == uid) {
             found = 1;
             break;
@@ -39,15 +48,16 @@ int has_passport(struct task_struct *task)
 }
 EXPORT_SYMBOL(has_passport);
 
-/* ===== 添加 PID（内部使用，同时记录 UID） ===== */
+/* ===== 添加 PID（内部） ===== */
 static int add_passport_entry(pid_t pid, uid_t uid)
 {
     struct passport_entry *entry;
+    unsigned int hash = passport_hash(pid);
 
+    // 先检查是否已存在
     read_lock(&passport_lock);
-    struct passport_entry *exist;
-    hash_for_each_possible(passport_table, exist, hlist, pid) {
-        if (exist->pid == pid) {
+    list_for_each_entry(entry, &passport_table[hash], list) {
+        if (entry->pid == pid && entry->uid == uid) {
             read_unlock(&passport_lock);
             return 0; // 已存在
         }
@@ -60,22 +70,24 @@ static int add_passport_entry(pid_t pid, uid_t uid)
     entry->pid = pid;
     entry->uid = uid;
     write_lock(&passport_lock);
-    hash_add(passport_table, &entry->hlist, pid);
+    list_add(&entry->list, &passport_table[hash]);
     write_unlock(&passport_lock);
 
+    pr_info("KPASS: added pid %d uid %d\n", pid, uid);
     return 0;
 }
 
-/* ===== 移除 PID（保留供调试） ===== */
+/* ===== 移除 PID（导出） ===== */
 int remove_passport_pid(pid_t pid)
 {
     struct passport_entry *entry;
     int found = 0;
+    unsigned int hash = passport_hash(pid);
 
     write_lock(&passport_lock);
-    hash_for_each_possible(passport_table, entry, hlist, pid) {
+    list_for_each_entry(entry, &passport_table[hash], list) {
         if (entry->pid == pid) {
-            hash_del(&entry->hlist);
+            list_del(&entry->list);
             kfree(entry);
             found = 1;
             break;
@@ -89,14 +101,15 @@ EXPORT_SYMBOL(remove_passport_pid);
 /* ===== 清空所有（调试） ===== */
 void clear_passport(void)
 {
-    struct passport_entry *entry;
-    struct hlist_node *tmp;
+    struct passport_entry *entry, *tmp;
     int i;
 
     write_lock(&passport_lock);
-    hash_for_each_safe(passport_table, i, tmp, entry, hlist) {
-        hash_del(&entry->hlist);
-        kfree(entry);
+    for (i = 0; i < PASSPORT_HASH_SIZE; i++) {
+        list_for_each_entry_safe(entry, tmp, &passport_table[i], list) {
+            list_del(&entry->list);
+            kfree(entry);
+        }
     }
     write_unlock(&passport_lock);
 }
@@ -128,9 +141,8 @@ static ssize_t passport_write(struct file *file, const char __user *buf,
     while (token) {
         pid = simple_strtol(token, NULL, 10);
         if (pid > 0) {
-            uid = current_uid();  // 记录当前写入进程的 UID
+            uid = current_uid();  // 记录写入进程的 UID
             add_passport_entry(pid, uid);
-            pr_info("KPASS: added pid %d with uid %d\n", pid, uid);
         }
         token = strtok(NULL, " \t\n");
     }
@@ -152,11 +164,13 @@ static ssize_t passport_read(struct file *file, char __user *buf,
     if (!page) return -ENOMEM;
 
     read_lock(&passport_lock);
-    hash_for_each(passport_table, i, entry) {
-        int sz = snprintf(tmp, sizeof(tmp), "pid=%d uid=%d ", entry->pid, entry->uid);
-        if (total + sz >= PAGE_SIZE) break;
-        memcpy(page + total, tmp, sz);
-        total += sz;
+    for (i = 0; i < PASSPORT_HASH_SIZE; i++) {
+        list_for_each_entry(entry, &passport_table[i], list) {
+            int sz = snprintf(tmp, sizeof(tmp), "pid=%d uid=%d ", entry->pid, entry->uid);
+            if (total + sz >= PAGE_SIZE) break;
+            memcpy(page + total, tmp, sz);
+            total += sz;
+        }
     }
     read_unlock(&passport_lock);
 
@@ -186,15 +200,22 @@ static const struct proc_ops passport_fops = {
     .proc_write = passport_write,
 };
 
-/* ===== 初始化（带调试日志） ===== */
+/* ===== 初始化 ===== */
 static int __init passport_init(void)
 {
+    int i;
+
     pr_info("KPASS: passport_init called\n");
+
+    // 初始化哈希桶
+    for (i = 0; i < PASSPORT_HASH_SIZE; i++)
+        INIT_LIST_HEAD(&passport_table[i]);
+
     if (!proc_create("myroot_passport", 0660, NULL, &passport_fops)) {
         pr_err("KPASS: proc_create failed\n");
         return -ENOMEM;
     }
-    pr_info("KPASS: /proc/myroot_passport created successfully\n");
+    pr_info("KPASS: /proc/myroot_passport created\n");
     return 0;
 }
 
