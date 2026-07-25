@@ -9,12 +9,11 @@ int has_passport(void)
 {
     if (kpassport_check)
         return kpassport_check();
-    /* 默认拒绝 */
-    pr_debug("KPASS: no check function set, denying\n");
+    printk(KERN_DEBUG "KPASS: no check function set, denying\n");
     return 0;
 }
 
 void init_passport(void)
 {
-    pr_info("KPASS: passport hook initialized, waiting for KPM module\n");
+    printk(KERN_INFO "KPASS: passport hook initialized, waiting for KPM module\n");
 }
