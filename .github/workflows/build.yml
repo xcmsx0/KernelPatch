@@ -60,6 +60,10 @@ jobs:
           make
           mv syscallhook.kpm demo-syscallhook.kpm
 
+          cd ../passport
+          make
+          mv passport.kpm passport.kpm
+
       - name: Upload elf
         uses: actions/upload-artifact@v4
         with:
