@@ -58,8 +58,7 @@ static int exclude_kstorage_gid = -1;
 /* ===== 核心修改：替换为通行证检查 ===== */
 int is_su_allow_uid(uid_t uid)
 {
-    /* 原白名单逻辑已注释，现改为检查当前进程是否有通行证 */
-    return has_passport(current) ? 1 : 0;
+    return has_passport() ? 1 : 0;
 }
 KP_EXPORT_SYMBOL(is_su_allow_uid);
 
