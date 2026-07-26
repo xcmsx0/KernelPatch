@@ -1,22 +1,28 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * Copyright (C) KPatch Team
+ */
 
-// kpms/passport/passport_kpm.c
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/netlink.h>
-#include <linux/socket.h>
-#include <linux/skbuff.h>
-#include <linux/sched.h>
-#include <linux/list.h>
+#include <log.h>
+#include <compiler.h>
+#include <kpmodule.h>
+#include <hook.h>
+#include <linux/printk.h>
 #include <linux/slab.h>
+#include <linux/list.h>
 #include <linux/spinlock.h>
+#include <linux/sched.h>
 #include <linux/cred.h>
+#include <linux/netlink.h>
+#include <linux/skbuff.h>
 #include <net/sock.h>
-#include <kputils.h>          // kp_lookup_name
-#include <kpmodule.h>        // KPM 框架
+#include <kputils.h>
 
-#define PASSPORT_NETLINK_UNIT 26
-#define PASSPORT_MSG_ADD_PID  1
+KPM_NAME("kpm-passport");
+KPM_VERSION("1.0.0");
+KPM_LICENSE("GPL v2");
+KPM_AUTHOR("KPatch Team");
+KPM_DESCRIPTION("Kernel Passport KPM Module with Netlink");
 
 /* ===== 白名单哈希表 ===== */
 #define PASSPORT_HASH_BITS 8
@@ -36,7 +42,7 @@ static inline unsigned int passport_hash(int pid)
     return pid & (PASSPORT_HASH_SIZE - 1);
 }
 
-/* 添加通行证 */
+/* ===== 添加通行证 ===== */
 static int add_passport_entry(int pid, uid_t uid)
 {
     struct passport_entry *entry;
@@ -60,11 +66,11 @@ static int add_passport_entry(int pid, uid_t uid)
     list_add(&entry->list, &passport_table[hash]);
     spin_unlock(&passport_lock);
 
-    printk(KERN_INFO "KPASS_KPM: added pid %d uid %d\n", pid, uid);
+    logkd("KPASS_KPM: added pid %d uid %d\n", pid, uid);
     return 0;
 }
 
-/* 检查函数：当前进程是否有通行证 */
+/* ===== 检查函数（由 kpimg 调用） ===== */
 static int check_passport(void)
 {
     int pid = current->pid;
@@ -83,14 +89,17 @@ static int check_passport(void)
     spin_unlock(&passport_lock);
 
     if (found)
-        printk(KERN_DEBUG "KPASS_KPM: pid %d uid %d PASS\n", pid, uid);
+        logkd("KPASS_KPM: pid %d uid %d PASS\n", pid, uid);
     else
-        printk(KERN_DEBUG "KPASS_KPM: pid %d uid %d DENIED\n", pid, uid);
+        logkd("KPASS_KPM: pid %d uid %d DENIED\n", pid, uid);
 
     return found;
 }
 
-/* ===== Netlink 服务端 ===== */
+/* ===== Netlink 通信 ===== */
+#define PASSPORT_NETLINK_UNIT 26
+#define PASSPORT_MSG_ADD_PID  1
+
 static struct sock *nl_sk = NULL;
 
 static void netlink_recv(struct sk_buff *skb)
@@ -104,7 +113,7 @@ static void netlink_recv(struct sk_buff *skb)
 
     nlh = (struct nlmsghdr *)skb->data;
     if (nlh->nlmsg_len < sizeof(*nlh) + sizeof(*payload)) {
-        printk(KERN_ERR "KPASS_KPM: invalid message length\n");
+        logkfd("KPASS_KPM: invalid message length\n");
         return;
     }
 
@@ -113,12 +122,111 @@ static void netlink_recv(struct sk_buff *skb)
 
     if (nlh->nlmsg_type == PASSPORT_MSG_ADD_PID) {
         add_passport_entry(pid, payload->uid);
-        printk(KERN_INFO "KPASS_KPM: received ADD_PID: %d\n", pid);
+        logkd("KPASS_KPM: received ADD_PID: %d\n", pid);
     } else {
-        printk(KERN_WARNING "KPASS_KPM: unknown message type: %d\n", nlh->nlmsg_type);
+        logkfd("KPASS_KPM: unknown message type: %d\n", nlh->nlmsg_type);
     }
 }
 
+static int netlink_init(void)
+{
+    struct netlink_kernel_cfg cfg = {
+        .input = netlink_recv,
+    };
+
+    nl_sk = netlink_kernel_create(&init_net, PASSPORT_NETLINK_UNIT, &cfg);
+    if (!nl_sk) {
+        logkfd("KPASS_KPM: netlink_kernel_create failed\n");
+        return -ENOMEM;
+    }
+    logkd("KPASS_KPM: netlink socket created (unit %d)\n", PASSPORT_NETLINK_UNIT);
+    return 0;
+}
+
+static void netlink_exit(void)
+{
+    if (nl_sk) {
+        netlink_kernel_release(nl_sk);
+        nl_sk = NULL;
+        logkd("KPASS_KPM: netlink socket released\n");
+    }
+}
+
+/* ===== 模块初始化（由 KPM 框架调用） ===== */
+static long passport_init(const char *args, const char *event, void *__user reserved)
+{
+    int i;
+    unsigned long check_addr;
+
+    logkd("KPASS_KPM: loading passport KPM module\n");
+
+    /* 初始化白名单 */
+    for (i = 0; i < PASSPORT_HASH_SIZE; i++)
+        INIT_LIST_HEAD(&passport_table[i]);
+
+    /* 1. 设置 kpassport_check 钩子 */
+    check_addr = kp_lookup_name("kpassport_check");
+    if (!check_addr) {
+        logkfd("KPASS_KPM: symbol kpassport_check not found!\n");
+        return -ENOENT;
+    }
+
+    /* 保存原函数指针并替换 */
+    int (*orig_check)(void) = *(int (**)(void))check_addr;
+    *(int (**)(void))check_addr = check_passport;
+    logkd("KPASS_KPM: hooked kpassport_check (orig=%p, new=%p)\n", orig_check, check_passport);
+
+    /* 2. 初始化 Netlink */
+    if (netlink_init() < 0) {
+        *(int (**)(void))check_addr = orig_check;
+        return -ENOMEM;
+    }
+
+    return 0;
+}
+
+static long passport_control0(const char *args, char *__user out_msg, int outlen)
+{
+    pr_info("KPASS_KPM: control called, args: %s\n", args);
+    return 0;
+}
+
+static long passport_exit(void *__user reserved)
+{
+    unsigned long check_addr;
+    struct passport_entry *entry, *tmp;
+    int i;
+
+    logkd("KPASS_KPM: unloading passport KPM module\n");
+
+    /* 1. 恢复钩子 */
+    check_addr = kp_lookup_name("kpassport_check");
+    if (check_addr) {
+        *(int (**)(void))check_addr = NULL;
+        logkd("KPASS_KPM: restored kpassport_check\n");
+    }
+
+    /* 2. 释放 Netlink */
+    netlink_exit();
+
+    /* 3. 清空白名单 */
+    spin_lock(&passport_lock);
+    for (i = 0; i < PASSPORT_HASH_SIZE; i++) {
+        list_for_each_entry_safe(entry, tmp, &passport_table[i], list) {
+            list_del(&entry->list);
+            kfree(entry);
+        }
+    }
+    spin_unlock(&passport_lock);
+
+    logkd("KPASS_KPM: unloaded\n");
+    return 0;
+}
+
+/* ===== KPM 框架宏 ===== */
+KPM_INIT(passport_init);
+KPM_CTL0(passport_control0);
+KPM_EXIT(passport_exit);
 static int netlink_init(void)
 {
     struct netlink_kernel_cfg cfg = {
